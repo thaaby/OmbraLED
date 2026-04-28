@@ -11,12 +11,22 @@ import sys
 from datetime import datetime
 import socket
 import glob
+import os
+import wave
+import random
 try:
     import serial
     HAS_SERIAL = True
 except ImportError:
     HAS_SERIAL = False
     print("[!] pyserial non installato — Arduino video disabilitato (pip install pyserial)")
+try:
+    import pygame
+    import pygame.sndarray
+    HAS_PYGAME = True
+except ImportError:
+    HAS_PYGAME = False
+    print("[!] pygame non installato — audio disabilitato (pip install pygame)")
 
 # ============================================================
 # DATABASE COLORI
@@ -819,6 +829,388 @@ class SimpleTracker:
         return (int(boosted_bgr[0]), int(boosted_bgr[1]), int(boosted_bgr[2]))
 
 
+# ============================================================
+# AUDIO: WAV + Pitch Shifting + Reverb + Delay Adattivo
+# ============================================================
+
+# Do pentatonica maggiore su 2 ottave (semitoni relativi alla nota base)
+# C, D, E, G, A, C+1, D+1, E+1, G+1, A+1
+PENTATONIC_SEMITONES = [-12, -10, -8, -5, -3, 0, 2, 4, 7, 9, 12, 14, 16, 19, 21]
+
+import threading
+
+
+class SoundManager:
+    """Audio reattivo: ogni persona = un WAV, pitchato sull'asse X, con reverb e delay adattivo."""
+    
+    def __init__(self, sound_dir='sound', sample_rate=44100):
+        self.enabled = False
+        if not HAS_PYGAME:
+            return
+        
+        self.sample_rate = sample_rate
+        try:
+            pygame.mixer.init(frequency=sample_rate, size=-16, channels=2, buffer=1024)
+            pygame.mixer.set_num_channels(48)  # Più canali per reverb + delay sovrapposti
+        except Exception as e:
+            print(f"[!] Errore inizializzazione audio: {e}")
+            return
+        
+        self.wav_data = {}  # filename -> numpy array int16 stereo (normalizzato)
+        self._load_all(sound_dir)
+        
+        self.person_wav = {}            # person_id -> filename WAV assegnato
+        self.person_last_pos = {}       # person_id -> (cx, cy)
+        self.person_last_trigger = {}   # person_id -> timestamp ultimo suono
+        
+        self.movement_threshold = 20    # Pixel di movimento minimo per triggerare
+        self.cooldown = 0.15            # Secondi tra un trigger e l'altro per persona
+        
+        # --- REVERB ATMOSFERICO (multi-tap con feedback interno) ---
+        # Riflessi precoci (early reflections) + coda lunga (late reverb)
+        self.reverb_early_taps =  [0.023, 0.031, 0.041, 0.053, 0.067, 0.079, 0.097]
+        self.reverb_early_gains = [0.30,  0.26,  0.22,  0.18,  0.15,  0.12,  0.10]
+        # Coda lunga (late diffuse reflections — atmosfera)
+        self.reverb_late_taps =   [0.13,  0.19,  0.27,  0.37,  0.48,  0.63,  0.81,  1.03,  1.31,  1.67]
+        self.reverb_late_gains =  [0.18,  0.16,  0.14,  0.12,  0.10,  0.08,  0.065, 0.05,  0.035, 0.02]
+        self.reverb_wet_mix = 1.0  #0.45  # 45% wet — bagna bene senza sommergere
+        
+        # --- DELAY ADATTIVO ---
+        self.delay_time = 0.4           # Tempo delay in secondi
+        self.delay_volume = 0.25        # Volume base del delay
+        self.delay_feedback_base = 0.3  # Feedback base (basso)
+        self.delay_feedback_max = 0.88  # Feedback massimo (silenzio prolungato)
+        self.silence_threshold = 2.5    # Secondi di silenzio prima che il feedback cresca
+        self.silence_ramp = 5.0         # Secondi per arrivare al feedback max
+        self.max_delay_generations = 12 # Ripetizioni massime del delay
+        
+        self.last_note_time = time.time()
+        self.pending_delays = []        # [(audio_stereo, play_time, generation)]
+        self.delay_lock = threading.Lock()
+        
+        # Thread background per gestire il delay
+        self._delay_running = True
+        self._delay_thread = threading.Thread(target=self._delay_loop, daemon=True)
+        self._delay_thread.start()
+        
+        self.enabled = len(self.wav_data) > 0
+        if self.enabled:
+            print(f"[♪] Audio: {len(self.wav_data)} WAV (normalizzati) + Reverb + Delay adattivo")
+        else:
+            print(f"[!] Nessun file WAV trovato in '{sound_dir}'")
+    
+    # ------------------------------------------------------------------
+    # CARICAMENTO + NORMALIZZAZIONE
+    # ------------------------------------------------------------------
+    
+    def _load_all(self, sound_dir):
+        """Carica tutti i WAV, normalizzandoli allo stesso volume di picco."""
+        if not os.path.isdir(sound_dir):
+            print(f"[!] Cartella '{sound_dir}' non trovata")
+            return
+        
+        raw_data = {}
+        global_peak = 0
+        
+        # Prima passata: carica tutto e trova il picco globale
+        for fname in sorted(os.listdir(sound_dir)):
+            if fname.lower().endswith('.wav'):
+                filepath = os.path.join(sound_dir, fname)
+                try:
+                    audio, sr = self._read_wav(filepath)
+                    if sr != self.sample_rate:
+                        audio = self._resample_rate(audio, sr, self.sample_rate)
+                    if audio.ndim == 1:
+                        audio = np.column_stack([audio, audio])
+                    raw_data[fname] = audio
+                    peak = np.max(np.abs(audio.astype(np.float64)))
+                    if peak > global_peak:
+                        global_peak = peak
+                except Exception as e:
+                    print(f"[!] Errore caricamento {fname}: {e}")
+        
+        # Seconda passata: normalizza tutto allo stesso picco (target: 85% del max int16)
+        target_peak = 32767 * 0.85
+        if global_peak > 0:
+            norm_factor = target_peak / global_peak
+        else:
+            norm_factor = 1.0
+        
+        for fname, audio in raw_data.items():
+            normalized = (audio.astype(np.float64) * norm_factor).clip(-32767, 32767).astype(np.int16)
+            self.wav_data[fname] = normalized
+    
+    def _read_wav(self, filepath):
+        """Legge un WAV e restituisce (numpy_array_int16, sample_rate)."""
+        with wave.open(filepath, 'rb') as wf:
+            sr = wf.getframerate()
+            n_frames = wf.getnframes()
+            n_ch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            raw = wf.readframes(n_frames)
+            
+            if sw == 1:
+                audio = np.frombuffer(raw, dtype=np.uint8).astype(np.int16) * 256 - 32768
+            elif sw == 2:
+                audio = np.frombuffer(raw, dtype=np.int16).copy()
+            elif sw == 4:
+                audio = (np.frombuffer(raw, dtype=np.int32) >> 16).astype(np.int16)
+            else:
+                audio = np.frombuffer(raw, dtype=np.int16).copy()
+            
+            if n_ch > 1:
+                audio = audio.reshape(-1, n_ch)
+                if n_ch > 2:
+                    audio = audio[:, :2]
+            
+            return audio, sr
+    
+    # ------------------------------------------------------------------
+    # RESAMPLING + PITCH SHIFT
+    # ------------------------------------------------------------------
+    
+    def _resample_rate(self, audio, old_sr, new_sr):
+        """Ricampiona l'audio a un nuovo sample rate."""
+        ratio = new_sr / old_sr
+        old_len = len(audio)
+        new_len = max(1, int(old_len * ratio))
+        indices = np.linspace(0, old_len - 1, new_len)
+        
+        if audio.ndim == 1:
+            return np.interp(indices, np.arange(old_len), audio.astype(np.float64)).astype(np.int16)
+        else:
+            result = np.zeros((new_len, audio.shape[1]), dtype=np.int16)
+            for ch in range(audio.shape[1]):
+                result[:, ch] = np.interp(
+                    indices, np.arange(old_len), audio[:, ch].astype(np.float64)
+                ).astype(np.int16)
+            return result
+    
+    def _pitch_shift(self, audio, semitones):
+        """Pitch shift via resampling. Positivo = più acuto, negativo = più grave."""
+        if semitones == 0:
+            return audio.copy()
+        factor = 2 ** (semitones / 12.0)
+        old_len = len(audio)
+        new_len = max(1, int(old_len / factor))
+        indices = np.linspace(0, old_len - 1, new_len)
+        
+        if audio.ndim == 1:
+            return np.interp(indices, np.arange(old_len), audio.astype(np.float64)).astype(np.int16)
+        else:
+            result = np.zeros((new_len, audio.shape[1]), dtype=np.int16)
+            for ch in range(audio.shape[1]):
+                result[:, ch] = np.interp(
+                    indices, np.arange(old_len), audio[:, ch].astype(np.float64)
+                ).astype(np.int16)
+            return result
+    
+    # ------------------------------------------------------------------
+    # REVERB ATMOSFERICO (baked into each note)
+    # ------------------------------------------------------------------
+    
+    def _apply_reverb(self, audio):
+        """Reverb atmosferico denso con coda lunga (~1.7s).
+        
+        - Early reflections: riflessi vicini per presenza spaziale
+        - Late reverb: coda diffusa lunga per atmosfera
+        - Secondo passaggio: riflessi dei riflessi per densità
+        - Dry/wet mix controllato
+        """
+        sr = self.sample_rate
+        all_taps = self.reverb_early_taps + self.reverb_late_taps
+        all_gains = self.reverb_early_gains + self.reverb_late_gains
+        
+        max_tap_samples = int(max(all_taps) * sr)
+        
+        audio_f = audio.astype(np.float64)
+        if audio_f.ndim == 1:
+            audio_f = audio_f.reshape(-1, 1)
+        
+        n_ch = audio_f.shape[1]
+        total_len = len(audio_f) + max_tap_samples
+        
+        # Buffer wet (solo riflessi)
+        wet = np.zeros((total_len, n_ch), dtype=np.float64)
+        
+        # Primo passaggio: riflessi del segnale originale
+        for tap_sec, gain in zip(all_taps, all_gains):
+            d = int(tap_sec * sr)
+            end = min(d + len(audio_f), total_len)
+            n = end - d
+            wet[d:end] += audio_f[:n] * gain
+        
+        # Secondo passaggio: riflessi dei riflessi (densità atmosferica)
+        # Usa solo i late taps come sorgente per le riflessioni secondarie
+        for tap_sec, gain in zip(self.reverb_late_taps[:5], self.reverb_late_gains[:5]):
+            d = int(tap_sec * sr)
+            # Copia dal wet già calcolato, con gain ridotto
+            src_end = min(len(wet) - d, len(wet))
+            if src_end > 0 and d < len(wet):
+                wet[d:d + src_end] += wet[:src_end] * (gain * 0.4)
+        
+        # Mix dry + wet
+        dry_gain = 1.0 - self.reverb_wet_mix * 0.5  # Dry leggermente attenuato
+        result = np.zeros((total_len, n_ch), dtype=np.float64)
+        result[:len(audio_f)] = audio_f * dry_gain
+        result += wet * self.reverb_wet_mix
+        
+        # Soft clip
+        max_val = np.max(np.abs(result))
+        if max_val > 32767:
+            result = result * (32767 / max_val)
+        
+        if audio.ndim == 1:
+            return result.flatten().astype(np.int16)
+        return result.astype(np.int16)
+    
+    # ------------------------------------------------------------------
+    # LOW-PASS FILTER (per il delay)
+    # ------------------------------------------------------------------
+    
+    def _apply_lowpass(self, audio, strength=0.4):
+        """Filtro passa-basso semplice via media mobile. 
+        
+        strength: 0.0 = nessun filtro, 1.0 = molto filtrato.
+        Simula il degrado di un nastro analogico.
+        """
+        kernel_size = max(3, int(strength * 20))
+        kernel = np.ones(kernel_size) / kernel_size
+        
+        audio_f = audio.astype(np.float64)
+        if audio_f.ndim == 1:
+            result = np.convolve(audio_f, kernel, mode='same')
+            return result.clip(-32767, 32767).astype(np.int16)
+        else:
+            result = np.zeros_like(audio_f)
+            for ch in range(audio_f.shape[1]):
+                result[:, ch] = np.convolve(audio_f[:, ch], kernel, mode='same')
+            return result.clip(-32767, 32767).astype(np.int16)
+    
+    # ------------------------------------------------------------------
+    # DELAY ADATTIVO (background thread)
+    # ------------------------------------------------------------------
+    
+    def _delay_loop(self):
+        """Thread background che gestisce il playback del delay.
+        
+        Ogni nota triggerata viene schedulata per essere risuonata dopo delay_time.
+        Le ripetizioni vengono filtrate (low-pass) e attenuate.
+        Se nessuna nota viene suonata per un po', il feedback cresce:
+        il delay si auto-alimenta e ripropone tutto il materiale precedente.
+        """
+        while self._delay_running:
+            time.sleep(0.02)  # Check ogni 20ms
+            
+            if not self.enabled:
+                continue
+            
+            now = time.time()
+            to_play = []
+            remaining = []
+            
+            with self.delay_lock:
+                for audio, play_time, generation in self.pending_delays:
+                    if now >= play_time:
+                        # Calcola feedback in base al silenzio
+                        silence_time = now - self.last_note_time
+                        if silence_time > self.silence_threshold:
+                            # Feedback cresce linearmente dal base al max
+                            t = min(1.0, (silence_time - self.silence_threshold) / self.silence_ramp)
+                            feedback = self.delay_feedback_base + t * (self.delay_feedback_max - self.delay_feedback_base)
+                        else:
+                            feedback = self.delay_feedback_base
+                        
+                        # Volume decresce con le generazioni, modulato dal feedback
+                        vol = self.delay_volume * (feedback ** (generation * 0.5))
+                        
+                        if vol > 0.03 and generation < self.max_delay_generations:
+                            to_play.append((audio, vol))
+                            # Filtra per la prossima generazione (nastro che degrada)
+                            filtered = self._apply_lowpass(audio, strength=0.3 + generation * 0.05)
+                            remaining.append((filtered, now + self.delay_time, generation + 1))
+                    else:
+                        remaining.append((audio, play_time, generation))
+                
+                self.pending_delays = remaining
+            
+            # Riproduci fuori dal lock per non bloccare il main thread
+            for audio, vol in to_play:
+                try:
+                    scaled = (audio.astype(np.float64) * vol).clip(-32767, 32767).astype(np.int16)
+                    sound = pygame.sndarray.make_sound(np.ascontiguousarray(scaled))
+                    sound.play()
+                except Exception:
+                    pass
+    
+    # ------------------------------------------------------------------
+    # UPDATE (chiamato per ogni persona ad ogni frame)
+    # ------------------------------------------------------------------
+    
+    def update(self, person_id, cx, cy, frame_w):
+        """Aggiorna posizione persona e triggera suono su movimento.
+        
+        cx, cy: centroide del bounding box della persona
+        frame_w: LARGHEZZA del frame (pitch mappato all'asse X orizzontale)
+        """
+        if not self.enabled:
+            return
+        
+        # Prima apparizione: assegna un WAV casuale
+        if person_id not in self.person_wav:
+            self.person_wav[person_id] = random.choice(list(self.wav_data.keys()))
+            self.person_last_pos[person_id] = (cx, cy)
+            self.person_last_trigger[person_id] = 0
+            return
+        
+        # Calcola distanza dal frame precedente
+        last_cx, last_cy = self.person_last_pos[person_id]
+        dist = math.sqrt((cx - last_cx) ** 2 + (cy - last_cy) ** 2)
+        
+        now = time.time()
+        if dist > self.movement_threshold and (now - self.person_last_trigger[person_id]) > self.cooldown:
+            # Mappa posizione X → nota pentatonica (sinistra = grave, destra = acuto)
+            x_ratio = cx / max(1, frame_w)
+            note_idx = int(x_ratio * (len(PENTATONIC_SEMITONES) - 1))
+            note_idx = max(0, min(note_idx, len(PENTATONIC_SEMITONES) - 1))
+            semitones = PENTATONIC_SEMITONES[note_idx]
+            
+            # Pitch shift
+            wav_key = self.person_wav[person_id]
+            audio = self.wav_data[wav_key]
+            pitched = self._pitch_shift(audio, semitones)
+            
+            # Applica reverb
+            reverbed = self._apply_reverb(pitched)
+            
+            # Play nota principale
+            try:
+                sound = pygame.sndarray.make_sound(np.ascontiguousarray(reverbed))
+                sound.play()
+            except Exception:
+                pass
+            
+            # Schedula per il delay
+            with self.delay_lock:
+                self.pending_delays.append((reverbed, now + self.delay_time, 1))
+            
+            self.last_note_time = now
+            self.person_last_pos[person_id] = (cx, cy)
+            self.person_last_trigger[person_id] = now
+        elif dist > self.movement_threshold:
+            # Aggiorna posizione anche se in cooldown
+            self.person_last_pos[person_id] = (cx, cy)
+    
+    def cleanup(self):
+        """Chiudi il mixer audio e il thread delay."""
+        self._delay_running = False
+        if HAS_PYGAME and self.enabled:
+            try:
+                pygame.mixer.quit()
+            except Exception:
+                pass
+
+
 def main():
     print("\n" + "=" * 50)
     print("  REGIA LEDWALL - Multi-Pannello + Arduino Video")
@@ -870,6 +1262,9 @@ def main():
     silhouette_tracker = SimpleTracker()
     solid_silhouette = True
     
+    # --- AUDIO ---
+    sound_manager = SoundManager(sound_dir='sound')
+    
     # --- CONNESSIONI ---
     global COMMON_ANODE
     udp_sock = create_udp_socket()
@@ -920,12 +1315,22 @@ def main():
                 
                 aggregate_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
                 
+                # Bounding boxes per calcolo centroide (audio)
+                boxes = r.boxes.xyxy.cpu().numpy()
+                
                 for i, person_id in enumerate(ids):
                     # Ridimensioniamo la maschera alla risoluzione originale della webcam
                     mask_raw = masks_data[i]
                     mask_resized = cv2.resize(mask_raw, (frame.shape[1], frame.shape[0]))
                     # YOLO genera maschere pulite, la soglia 0.5 è ottimale
-                    mask_2d = mask_resized > 0.5 
+                    mask_2d = mask_resized > 0.5
+                    
+                    # Audio: calcola centroide e triggera suono su movimento
+                    if i < len(boxes):
+                        x1, y1, x2, y2 = boxes[i]
+                        cx = (x1 + x2) / 2
+                        cy = (y1 + y2) / 2
+                        sound_manager.update(person_id, cx, cy, frame.shape[1])
                     
                     if solid_silhouette:
                         # Estrae il colore dominante REALE dai vestiti/corpo della persona
@@ -1113,6 +1518,8 @@ def main():
                 print("[OK] LED Arduino spenti. Seriale chiusa.")
             except Exception:
                 pass
+        # Chiudi audio
+        sound_manager.cleanup()
 
 
 if __name__ == "__main__":
