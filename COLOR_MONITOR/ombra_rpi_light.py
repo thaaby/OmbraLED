@@ -382,6 +382,11 @@ def main():
         print("[X] Impossibile aprire la webcam!")
         return
         
+    # Check per l'Arduino (spostato DOPO la webcam come richiesto)
+    arduino_ser = create_arduino_serial()
+    arduino_ready = True
+    arduino_last_send_time = time.time()
+    
     # Risoluzione estremamente bassa in lettura per liberare la CPU
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
@@ -400,10 +405,6 @@ def main():
     
     global COMMON_ANODE
     udp_sock = create_udp_socket()
-    arduino_ser = create_arduino_serial()
-    
-    arduino_ready = True
-    arduino_last_send_time = time.time()
     
     # Pre-allocazione buffer
     bg_image = None
@@ -509,10 +510,10 @@ def main():
                         arduino_last_send_time = time.time()
                     except: arduino_ser = None
             
-            # NOTA: cv2.imshow è stato disabilitato per risparmiare moltissima CPU
-            # ed evitare crash su RPi in ambienti Headless (senza monitor attaccato)
-            # time.sleep sostituisce waitKey
-            time.sleep(0.01)
+            # Mostra la GUI su monitor (riattivato per i test)
+            cv2.imshow('Regia Ledwall Light', frame_ridimensionato)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord('q'): break
             
     finally:
         cap.release()
