@@ -406,6 +406,12 @@ def main():
     global COMMON_ANODE
     udp_sock = create_udp_socket()
     
+    high_res_mode = False
+    fullscreen = False
+    show_background = False
+    current_imgsz = 160
+    cv2.namedWindow('Regia Ledwall Light', cv2.WINDOW_NORMAL)
+    
     # Pre-allocazione buffer
     bg_image = None
     final_frame_float = None
@@ -418,14 +424,17 @@ def main():
             frame = cv2.flip(frame, 1)
             original_frame = frame.copy()
             
-            # Parametro imgsz basso fa girare la rete IA più velocemente
-            results = model.track(frame, persist=True, classes=[0], verbose=False, imgsz=160)
+            # Parametro imgsz dinamico (basso = veloce, alto = bordi netti per HD)
+            results = model.track(frame, persist=True, classes=[0], verbose=False, imgsz=current_imgsz)
             
             if bg_image is None or bg_image.shape != frame.shape:
                 bg_image = np.zeros(frame.shape, dtype=np.uint8)
                 final_frame_float = np.zeros(frame.shape, dtype=np.float32)
             else:
                 final_frame_float.fill(0)
+            
+            # Background reale o nero in base al toggle [B]
+            active_bg = original_frame if show_background else bg_image
                 
             r = results[0]
             if r.masks is not None and r.boxes.id is not None:
@@ -458,11 +467,18 @@ def main():
                     scale = np.ones_like(max_vals)
                     np.divide(255.0, max_vals, out=scale, where=max_vals > 255.0)
                     final_frame_float *= scale
-                    frame = final_frame_float.astype(np.uint8)
+                    silhouette_layer = final_frame_float.astype(np.uint8)
+                    if show_background:
+                        # Dove c'è silhouette (pixel non neri) sovrascriviamo il background
+                        mask_any = np.any(silhouette_layer > 0, axis=-1)
+                        frame = active_bg.copy()
+                        frame[mask_any] = silhouette_layer[mask_any]
+                    else:
+                        frame = silhouette_layer
                 else:
-                    frame = np.where(np.stack((aggregate_mask > 0,)*3, axis=-1), frame, bg_image)
+                    frame = np.where(np.stack((aggregate_mask > 0,)*3, axis=-1), frame, active_bg)
             else:
-                frame = bg_image
+                frame = active_bg
                 
             # Scala l'immagine
             h_in, w_in = frame.shape[:2]
@@ -511,9 +527,37 @@ def main():
                     except: arduino_ser = None
             
             # Mostra la GUI su monitor (riattivato per i test)
-            cv2.imshow('Regia Ledwall Light', frame_ridimensionato)
+            if high_res_mode:
+                cv2.imshow('Regia Ledwall Light', frame) # Frame in alta definizione
+            else:
+                cv2.imshow('Regia Ledwall Light', frame_ridimensionato) # Anteprima Ledwall
+                
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord('q'): break
+            elif key == ord('f'):
+                fullscreen = not fullscreen
+                if fullscreen:
+                    cv2.setWindowProperty('Regia Ledwall Light', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                else:
+                    cv2.setWindowProperty('Regia Ledwall Light', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+            elif key == ord('a'):
+                high_res_mode = not high_res_mode
+                if high_res_mode:
+                    print("\n[HD] Passaggio a 640x480 (Modalità Monitor Media)...")
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    current_imgsz = 320  # Bilanciamento perfetto per Raspberry Pi
+                    bg_image = None
+                else:
+                    print("\n[LD] Passaggio a 320x240 (Modalità Leggera LED)...")
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                    current_imgsz = 160
+                    bg_image = None
+            elif key == ord('b'):
+                show_background = not show_background
+                state = "ATTIVO (sfondo reale)" if show_background else "DISATTIVO (sfondo nero)"
+                print(f"\n[TOGGLE] Sfondo webcam: {state}")
             
     finally:
         cap.release()
